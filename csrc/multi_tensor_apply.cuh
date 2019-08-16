@@ -2,6 +2,7 @@
 #include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
+#include "compat.h"
 
 #include <assert.h>
 
@@ -20,6 +21,7 @@ template<int n> struct TensorListMetadata
   int sizes[depth_to_max_tensors[n-1]];
   unsigned char block_to_tensor[depth_to_max_blocks[n-1]];
   int block_to_chunk[depth_to_max_blocks[n-1]]; // I fear this needs to be a full int.
+  int start_tensor_this_launch;
 };
 
 
@@ -44,19 +46,19 @@ void multi_tensor_apply(
   T callable,
   ArgTypes... args)
 {
-  AT_CHECK(tensor_lists.size() == depth, "tensor_lists.size() != depth");
+  TORCH_CHECK(tensor_lists.size() == depth, "tensor_lists.size() != depth");
   int len0 = tensor_lists[0].size();
-  AT_CHECK(len0 > 0, "tensor_lists[0].size() is not > 0");
+  TORCH_CHECK(len0 > 0, "tensor_lists[0].size() is not > 0");
 
   for(int l = 0; l < tensor_lists.size(); l++) // No range-based for because I need indices
   {
-    AT_CHECK(tensor_lists[l].size() == len0, "Size mismatch among tensor lists");
+    TORCH_CHECK(tensor_lists[l].size() == len0, "Size mismatch among tensor lists");
     for(int t = 0; t < tensor_lists[l].size(); t++)
     {
       // TODO:  Print which tensor fails.
-      AT_CHECK(tensor_lists[l][t].is_contiguous(), "A tensor was not contiguous.");
-      AT_CHECK(tensor_lists[l][t].is_cuda(), "A tensor was not cuda.");
-      AT_CHECK(tensor_lists[l][t].numel() == tensor_lists[0][t].numel(), "Size mismatch");
+      TORCH_CHECK(tensor_lists[l][t].is_contiguous(), "A tensor was not contiguous.");
+      TORCH_CHECK(tensor_lists[l][t].is_cuda(), "A tensor was not cuda.");
+      TORCH_CHECK(tensor_lists[l][t].numel() == tensor_lists[0][t].numel(), "Size mismatch");
     }
   }
 
@@ -66,6 +68,7 @@ void multi_tensor_apply(
 
   auto stream = at::cuda::getCurrentCUDAStream();
   
+  tl.start_tensor_this_launch = 0;
   int loc_block_info = 0;
   int loc_tensor_info = 0;
   for(int t = 0; t < ntensors; t++)
@@ -106,6 +109,7 @@ void multi_tensor_apply(
         {
           // std::cout << "Hit case 1 " << cond1 << " " << cond2 << " " << cond3 << std::endl;
           loc_tensor_info = 0; 
+          tl.start_tensor_this_launch = t + 1;
         }
         else
         {
@@ -114,6 +118,7 @@ void multi_tensor_apply(
           for(int d = 0; d < depth; d++)
             tl.addresses[d][0] = tl.addresses[d][loc_tensor_info-1];
           loc_tensor_info = 1;
+          tl.start_tensor_this_launch = t;
         }
       }
     }

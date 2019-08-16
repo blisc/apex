@@ -104,8 +104,6 @@ class Reducer(object):
     When used with this launcher, :class:`Reducer` assumes 1:1 mapping of processes to GPUs.
     It also assumes that your script calls ``torch.cuda.set_device(args.rank)`` before creating the model.
 
-    main_reducer.py in https://github.com/NVIDIA/apex/tree/master/examples/imagenet shows example usage.
-
     Args:
         module_or_grads_list: Either a network definition (module) being run in multi-gpu/distributed mode, or an iterable of gradients to be reduced.  If a module is passed in, the Reducer constructor will sync the parameters across processes (broadcasting from rank 0) to make sure they're all initialized with the same values.  If a list of gradients (that came from some module) is passed in, the user is responsible for manually syncing that module's parameters at the beginning of training.
     """
@@ -143,7 +141,7 @@ class DistributedDataParallel(Module):
     When used with this launcher, :class:`DistributedDataParallel` assumes 1:1 mapping of processes to GPUs.
     It also assumes that your script calls ``torch.cuda.set_device(args.rank)`` before creating the model.
 
-    https://github.com/NVIDIA/apex/tree/master/examples/distributed shows detailed usage.
+    https://github.com/NVIDIA/apex/tree/master/examples/simple/distributed shows detailed usage.
     https://github.com/NVIDIA/apex/tree/master/examples/imagenet shows another example
     that combines :class:`DistributedDataParallel` with mixed precision training.
 
@@ -170,8 +168,7 @@ class DistributedDataParallel(Module):
                  retain_allreduce_buffers=False,
                  allreduce_always_fp32=False,
                  gradient_average=True,
-                 gradient_predivide_factor=1.0,
-                 gradient_average_split_factor=None):
+                 gradient_predivide_factor=1.0):
         super(DistributedDataParallel, self).__init__()
 
         # Backward/forward compatibility around 
@@ -191,10 +188,6 @@ class DistributedDataParallel(Module):
 
         if shared_param is not None:
             raise ValueError("shared_param is no longer supported as an option.  It was misleadingly named from the start.  It turns out overlapping communication with computation should work fine with shared parameters.  If you still wish to delay communication to the end of the backward pass, use delay_allreduce=True|False instead.") 
-
-        if gradient_average_split_factor is not None:
-            print("Warning:  gradient_average_split_factor has been renamed to gradient_predivide_factor.  For now, gradient_average_split_factor will also work, but please update to gradient_predivide_factor instead.")
-            self.gradient_predivide_factor = gradient_average_split_factor
 
         self.world_size = float(dist.get_world_size())
 
@@ -217,6 +210,8 @@ class DistributedDataParallel(Module):
         self.reduction_event = torch.cuda.Event(enable_timing=False, blocking=False) 
         
         self.module = module
+
+        self._disable_allreduce = False
         
         if self._backend == self.backend_enum_holder.NCCL:
             for param in self.module.parameters():
@@ -251,6 +246,12 @@ class DistributedDataParallel(Module):
             del attrs['self.reduction_stream']
             del attrs['self.reduction_event']
             return attrs
+
+    def enable_allreduce(self):
+        self._disable_allreduce = False
+
+    def disable_allreduce(self):
+        self._disable_allreduce = True
       
     # Broadcast rank 0's bucket structure across all processes, and have all processes 
     # regenerate their bucket structures to match. 
@@ -329,44 +330,45 @@ class DistributedDataParallel(Module):
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
                     def allreduce_hook(*unused):
-                        if self.delay_allreduce or self.needs_refresh:
-                            # TODO:  How do we want to handle multiple backward passes between
-                            # each forward, e.g., backward passes with retain_graph=True?
-                            # needs_refresh and callback_queued are both vulnerable states.
-                            if not self.delay_allreduce and self.needs_refresh:
-                                # Use the backward pass to build the bucket structure on the fly.
-                                active_i = self.param_id_to_active_i[id(param)]
+                        if not self._disable_allreduce:
+                            if self.delay_allreduce or self.needs_refresh:
+                                # TODO:  How do we want to handle multiple backward passes between
+                                # each forward, e.g., backward passes with retain_graph=True?
+                                # needs_refresh and callback_queued are both vulnerable states.
+                                if not self.delay_allreduce and self.needs_refresh:
+                                    # Use the backward pass to build the bucket structure on the fly.
+                                    active_i = self.param_id_to_active_i[id(param)]
 
-                                # Float, half, and double tensors are grouped into buckets separately.
-                                current_type = self.param_type_to_tmp_i[param.type()]
+                                    # Float, half, and double tensors are grouped into buckets separately.
+                                    current_type = self.param_type_to_tmp_i[param.type()]
   
-                                self.tmp_buckets[current_type].append(active_i)                          
+                                    self.tmp_buckets[current_type].append(active_i)                          
 
-                                ship_tmp_bucket = False
-                                if self.custom_allreduce_triggers:
-                                    if id(param) in self.allreduce_trigger_params:
-                                        ship_tmp_bucket = True
-                                else:
-                                    self.tmp_numels[current_type] += param.numel()
-                                    if self.tmp_numels[current_type] >= self.message_size:
-                                        ship_tmp_bucket = True
+                                    ship_tmp_bucket = False
+                                    if self.custom_allreduce_triggers:
+                                        if id(param) in self.allreduce_trigger_params:
+                                            ship_tmp_bucket = True
+                                    else:
+                                        self.tmp_numels[current_type] += param.numel()
+                                        if self.tmp_numels[current_type] >= self.message_size:
+                                            ship_tmp_bucket = True
 
-                                # To consider:  If custom_allreduce_triggers are in use, ship all
-                                # tmp_buckets, not just tmp_buckets[current_type].
-                                if ship_tmp_bucket:
-                                    self.active_i_buckets.append(self.tmp_buckets[current_type])
-                                    self.tmp_buckets[current_type] = []
-                                    self.tmp_numels[current_type] = 0
-                            
-                            if not self.callback_queued:
-                                Variable._execution_engine.queue_callback(allreduce_params)
-                                self.callback_queued = True
-                        else:
-                            if not self.callback_queued:
-                                Variable._execution_engine.queue_callback(overlapping_backward_epilogue)
-                                self.callback_queued = True 
+                                    # To consider:  If custom_allreduce_triggers are in use, ship all
+                                    # tmp_buckets, not just tmp_buckets[current_type].
+                                    if ship_tmp_bucket:
+                                        self.active_i_buckets.append(self.tmp_buckets[current_type])
+                                        self.tmp_buckets[current_type] = []
+                                        self.tmp_numels[current_type] = 0
+                                
+                                if not self.callback_queued:
+                                    Variable._execution_engine.queue_callback(allreduce_params)
+                                    self.callback_queued = True
+                            else:
+                                if not self.callback_queued:
+                                    Variable._execution_engine.queue_callback(overlapping_backward_epilogue)
+                                    self.callback_queued = True 
 
-                            self.comm_ready_buckets(param)
+                                self.comm_ready_buckets(param)
                         
                     grad_acc.register_hook(allreduce_hook)
                     self.grad_accs.append(grad_acc)
@@ -387,7 +389,8 @@ class DistributedDataParallel(Module):
         dist.all_reduce(tensor_to_allreduce)
 
         if self.gradient_average:
-            tensor_to_allreduce.mul_(self.gradient_predivide_factor/self.world_size)
+            if self.gradient_predivide_factor != self.world_size:
+                tensor_to_allreduce.mul_(self.gradient_predivide_factor/self.world_size)
 
         if self.allreduce_always_fp32 and tensor is not tensor_to_allreduce:
             tensor.copy_(tensor_to_allreduce)
@@ -424,7 +427,7 @@ class DistributedDataParallel(Module):
         # training script, and overwritten in the next forward pass.  So it's harmless. 
         if self.retain_allreduce_buffers:
             self.allreduce_buffers = [None for _ in range(len(split_buckets))]
-        
+    
         for i, bucket in enumerate(split_buckets):
             allreduced = self.allreduce_maybe_retain(bucket, i)
 
@@ -471,38 +474,39 @@ class DistributedDataParallel(Module):
         
     def forward(self, *inputs, **kwargs):
         result = self.module(*inputs, **kwargs)
-        
-        if not self.delay_allreduce:
-            param_list = [param for param in self.module.parameters() if param.requires_grad]
+       
+        if not self._disable_allreduce:
+            if not self.delay_allreduce:
+                param_list = [param for param in self.module.parameters() if param.requires_grad]
 
-            # Conditions under which to refresh self.record
-            # Forward has the authority to set needs_refresh to True, but only allreduce_params
-            # in backward has the authority to set needs_refresh to False.
-            # Parentheses are not necessary for correct order of operations, but make the intent clearer.
-            if ((not self.active_params) or 
-                (len(param_list) != len(self.active_params)) or
-                any([param1 is not param2 for param1, param2 in zip(param_list, self.active_params)])):
-                self.needs_refresh = True
+                # Conditions under which to refresh self.record
+                # Forward has the authority to set needs_refresh to True, but only allreduce_params
+                # in backward has the authority to set needs_refresh to False.
+                # Parentheses are not necessary for correct order of operations, but make the intent clearer.
+                if ((not self.active_params) or 
+                    (len(param_list) != len(self.active_params)) or
+                    any([param1 is not param2 for param1, param2 in zip(param_list, self.active_params)])):
+                    self.needs_refresh = True
 
-            if self.needs_refresh:
-                self.active_i_buckets = []
-                self.buckets = []
-                self.tmp_buckets = [[], [], []] # [running half, float, double buckets]
-                self.tmp_numels = [0, 0, 0]
-                self.bucket_sizes = []
-                self.param_id_to_active_i = {id(param) : i for i, param in enumerate(param_list)}  
-                self.param_id_to_bucket = {}
-            else:
-                self.buckets = [[None for _ in range(self.bucket_sizes[i])] 
-                                for i in range(self.num_buckets)] 
-                self.buckets_ready_size = [0 for i in range(self.num_buckets)]
-                if(self.retain_allreduce_buffers):
-                    self.allreduce_buffers = [None for _ in range(self.num_buckets)]
-                self.next_bucket = 0
-                self.ready_buckets_not_reduced = set()
+                if self.needs_refresh:
+                    self.active_i_buckets = []
+                    self.buckets = []
+                    self.tmp_buckets = [[], [], []] # [running half, float, double buckets]
+                    self.tmp_numels = [0, 0, 0]
+                    self.bucket_sizes = []
+                    self.param_id_to_active_i = {id(param) : i for i, param in enumerate(param_list)}  
+                    self.param_id_to_bucket = {}
+                else:
+                    self.buckets = [[None for _ in range(self.bucket_sizes[i])] 
+                                   for i in range(self.num_buckets)] 
+                    self.buckets_ready_size = [0 for i in range(self.num_buckets)]
+                    if(self.retain_allreduce_buffers):
+                        self.allreduce_buffers = [None for _ in range(self.num_buckets)]
+                    self.next_bucket = 0
+                    self.ready_buckets_not_reduced = set()
             
-            self.active_params = param_list
+                self.active_params = param_list
 
-        self.callback_queued = False
+            self.callback_queued = False
         
         return result
