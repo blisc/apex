@@ -70,9 +70,10 @@ class LARC(object):
             weight_decays = []
             for group in self.optim.param_groups:
                 # absorb weight decay control from optimizer
-                weight_decay = group['weight_decay'] if 'weight_decay' in group else 0
-                weight_decays.append(weight_decay)
-                group['weight_decay'] = 0
+                weight_decay = 0
+                # weight_decay = group['weight_decay'] if 'weight_decay' in group else 0
+                # weight_decays.append(weight_decay)
+                # group['weight_decay'] = 0
                 for p in group['params']:
                     if p.grad is None:
                         continue
@@ -93,5 +94,5 @@ class LARC(object):
 
         self.optim.step()
         # return weight decay control to optimizer
-        for i, group in enumerate(self.optim.param_groups):
-            group['weight_decay'] = weight_decays[i]
+        # for i, group in enumerate(self.optim.param_groups):
+        #     group['weight_decay'] = weight_decays[i]
